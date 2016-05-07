@@ -18,8 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-// Variable frequency CPU usage sampling on Linux via /proc
-// Maybe this will turn into something like prstat on Solaris
+// Variable frequency CPU usage sampling via /proc and delay stats via netlink
 
 // easy
 // TODO - tui use keyboard to highlight a proc to make it be on top
@@ -27,7 +26,6 @@
 
 // hard
 // TODO - use netlink to watch for processes exiting, or perf_events for start/exit
-// TODO - split into long running backend and multiple frontends
 
 package main
 
@@ -44,31 +42,16 @@ import (
 	lib "github.com/uber-common/cpustat/lib"
 )
 
-const maxProcsToScan = 2048 // upper bound on proc table size
-
-func main() {
-	var interval = flag.Int("i", 200, "interval (ms) between measurements")
-	var samples = flag.Int("s", 10, "sample counts to aggregate for output")
-	var topN = flag.Int("n", 10, "show top N processes")
-	var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
-	var memprofile = flag.String("memprofile", "", "write memory profile to this file")
-	var jiffy = flag.Int("jiffy", 100, "length of a jiffy")
-	var useTui = flag.Bool("t", false, "use fancy terminal mode")
-
-	flag.Parse()
-
+func checkPrivs() {
 	if os.Geteuid() != 0 {
 		fmt.Println("This program uses the netlink taskstats inteface, so it must be run as root.")
 		os.Exit(1)
 	}
+}
 
-	if *interval <= 10 {
-		fmt.Println("The minimum sampling interval is 10ms")
-		os.Exit(1)
-	}
-
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
+func maybeStartProfile(argStr string) {
+	if argStr != "" {
+		f, err := os.Create(argStr)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -76,7 +59,9 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+}
 
+func waitForExit(memprofile string) chan string {
 	uiQuitChan := make(chan string)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt)
@@ -90,8 +75,8 @@ func main() {
 		}
 		pprof.StopCPUProfile()
 
-		if *memprofile != "" {
-			f, err := os.Create(*memprofile)
+		if memprofile != "" {
+			f, err := os.Create(memprofile)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -102,42 +87,70 @@ func main() {
 		os.Exit(0)
 	}()
 
+	return uiQuitChan
+}
+
+func main() {
+	var interval = flag.Int("i", 200, "interval (ms) between measurements")
+	var samples = flag.Int("s", 10, "sample counts to aggregate for output")
+	var topN = flag.Int("n", 10, "show top N processes")
+	var maxProcsToScan = flag.Int("maxprocs", 2048, "upper limit on process table size")
+	var usrOnly = flag.String("u", "", "only show procs owned by this list of users")
+	var pidOnly = flag.String("p", "", "only show procs in this list of pids")
+	var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+	var memprofile = flag.String("memprofile", "", "write memory profile to this file")
+	var jiffy = flag.Int("jiffy", 100, "length of a jiffy")
+	var useTui = flag.Bool("t", false, "use fancy terminal mode")
+
+	flag.Parse()
+
+	checkPrivs()
+
+	if *interval < 10 {
+		fmt.Println("The minimum sampling interval is 10ms")
+		os.Exit(1)
+	}
+	intervalms := uint32(*interval)
+
+	maybeStartProfile(*cpuprofile)
+	uiQuitChan := waitForExit(*memprofile)
+	filters := lib.FiltersInit(*usrOnly, *pidOnly)
 	nlConn := lib.NLInit()
 
 	if *useTui {
 		go tuiInit(uiQuitChan, *interval)
+	} else {
+		textInit(*interval, *samples, *topN, filters)
 	}
 
-	cmdNames := make(lib.CmdlineMap)
+	infoMap := make(lib.ProcInfoMap)
 
-	procCur := make(lib.ProcStatsMap)
-	procPrev := make(lib.ProcStatsMap)
-	procSum := make(lib.ProcStatsMap)
+	procCur := lib.NewProcSampleList(*maxProcsToScan)
+	procPrev := lib.NewProcSampleList(*maxProcsToScan)
+	procSum := make(lib.ProcSampleMap)
 	procHist := make(lib.ProcStatsHistMap)
-
-	taskCur := make(lib.TaskStatsMap)
-	taskPrev := make(lib.TaskStatsMap)
-	taskSum := make(lib.TaskStatsMap)
 	taskHist := make(lib.TaskStatsHistMap)
 
-	var sysCur *lib.SystemStats
-	var sysPrev *lib.SystemStats
+	var sysCur lib.SystemStats
+	var sysPrev lib.SystemStats
 	var sysSum *lib.SystemStats
 	var sysHist *lib.SystemStatsHist
 
 	var t1, t2 time.Time
+	var err error
 
 	// run all scans one time to establish a baseline
-	pids := make(lib.Pidlist, 0, maxProcsToScan)
-	lib.GetPidList(&pids, maxProcsToScan)
+	pids := make(lib.Pidlist, 0, *maxProcsToScan)
 
 	t1 = time.Now()
-	var err error
-	procPrev = lib.ProcStatsReader(pids, cmdNames)
-	taskPrev = lib.TaskStatsReader(nlConn, pids, cmdNames)
-	if sysPrev, err = lib.SystemStatsReader(); err != nil {
-		log.Fatal(err)
+	lib.GetPidList(&pids, *maxProcsToScan)
+	lib.ProcStatsReader(pids, filters, &procPrev, infoMap)
+	lib.TaskStatsReader(nlConn, pids, &procPrev)
+	err = lib.SystemStatsReader(&sysPrev)
+	if err != nil {
+		panic(err)
 	}
+
 	sysSum = &lib.SystemStats{}
 	sysHist = lib.NewSysStatsHist()
 	t2 = time.Now()
@@ -151,27 +164,28 @@ func main() {
 			time.Sleep(adjustedSleep)
 
 			t1 = time.Now()
-			lib.GetPidList(&pids, maxProcsToScan)
+			lib.GetPidList(&pids, *maxProcsToScan)
 
-			procCur = lib.ProcStatsReader(pids, cmdNames)
-			procDelta := lib.ProcStatsRecord(*interval, procCur, procPrev, procSum)
+			lib.ProcStatsReader(pids, filters, &procCur, infoMap)
+			lib.TaskStatsReader(nlConn, pids, &procCur)
+
+			procDelta := make(lib.ProcSampleMap, len(pids))
+			lib.ProcStatsRecord(intervalms, procCur, procPrev, procSum, procDelta)
 			lib.UpdateProcStatsHist(procHist, procDelta)
-			procPrev = procCur
+			lib.TaskStatsRecord(intervalms, procCur, procPrev, procSum, procDelta)
+			lib.UpdateTaskStatsHist(taskHist, procDelta)
 
-			taskCur = lib.TaskStatsReader(nlConn, pids, cmdNames)
-			taskDelta := lib.TaskStatsRecord(*interval, taskCur, taskPrev, taskSum)
-			lib.UpdateTaskStatsHist(taskHist, taskDelta)
-			taskPrev = taskCur
+			procPrev, procCur = procCur, procPrev
 
-			if sysCur, err = lib.SystemStatsReader(); err != nil {
+			if err = lib.SystemStatsReader(&sysCur); err != nil {
 				log.Fatal(err)
 			}
-			sysDelta := lib.SystemStatsRecord(*interval, sysCur, sysPrev, sysSum)
+			sysDelta := lib.SystemStatsRecord(intervalms, &sysCur, &sysPrev, sysSum)
 			lib.UpdateSysStatsHist(sysHist, sysDelta)
 			sysPrev = sysCur
 
 			if *useTui {
-				tuiGraphUpdate(procDelta, sysDelta, taskDelta, topPids, *jiffy, *interval)
+				tuiGraphUpdate(procDelta, sysDelta, topPids, uint32(*jiffy), intervalms)
 			}
 
 			t2 = time.Now()
@@ -179,19 +193,19 @@ func main() {
 		}
 
 		topHist := sortList(procHist, taskHist, *topN)
-		for i := 0; i < *topN; i++ {
+		topPids = topPids[:len(topHist)]
+		for i := 0; i < len(topHist) && i < *topN; i++ {
 			topPids[i] = topHist[i].pid
 		}
 
 		if *useTui {
-			tuiListUpdate(cmdNames, topPids, procSum, procHist, taskSum, taskHist, sysSum, sysHist, *jiffy, *interval, *samples)
+			tuiListUpdate(infoMap, topPids, procSum, procHist, taskHist, sysSum, sysHist, *jiffy, *interval, *samples)
 		} else {
-			dumpStats(cmdNames, topPids, procSum, procHist, taskSum, taskHist, sysSum, sysHist, *jiffy, *interval, *samples)
+			dumpStats(infoMap, topPids, procSum, procHist, taskHist, sysSum, sysHist, *jiffy, *interval, *samples)
 		}
 		procHist = make(lib.ProcStatsHistMap)
-		procSum = make(lib.ProcStatsMap)
 		taskHist = make(lib.TaskStatsHistMap)
-		taskSum = make(lib.TaskStatsMap)
+		procSum = make(lib.ProcSampleMap)
 		sysHist = lib.NewSysStatsHist()
 		sysSum = &lib.SystemStats{}
 		t2 = time.Now()

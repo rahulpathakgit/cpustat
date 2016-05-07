@@ -28,39 +28,39 @@ import (
 	"time"
 )
 
-// ProcStats holds the information that comes back from /proc/[pid]/stat
+type ProcSample struct {
+	Pid  int
+	Proc ProcStats
+	Task TaskStats
+}
+
+type ProcSampleList struct {
+	Samples []ProcSample
+	Len     uint32
+}
+
+func NewProcSampleList(size int) ProcSampleList {
+	return ProcSampleList{
+		make([]ProcSample, size),
+		0,
+	}
+}
+
+type ProcSampleMap map[int]*ProcSample
+
+// ProcStats holds the fast changing data that comes back from /proc/[pid]/stat
+// These fields are documented in the linux proc(5) man page
+// There are many more of these fields that don't change very often. These are stored in the Cmdline struct.
 type ProcStats struct {
-	CaptureTime         time.Time
-	Pid                 uint64
-	Comm                string
-	State               string
-	Ppid                uint64
-	Pgrp                int64
-	Session             int64
-	Ttynr               int64
-	Tpgid               int64
-	Flags               uint64
-	Minflt              uint64
-	Cminflt             uint64
-	Majflt              uint64
-	Cmajflt             uint64
-	Utime               uint64
-	Stime               uint64
-	Cutime              uint64
-	Cstime              uint64
-	Priority            int64
-	Nice                int64
-	Numthreads          uint64
-	Starttime           uint64
-	Vsize               uint64
-	Rss                 uint64
-	Rsslim              uint64
-	Processor           uint64
-	Rtpriority          uint64
-	Policy              uint64
-	Delayacctblkioticks uint64
-	Guesttime           uint64
-	Cguesttime          uint64
+	CaptureTime time.Time
+	Utime       uint64
+	Stime       uint64
+	Cutime      uint64
+	Cstime      uint64
+	Numthreads  uint64
+	Rss         uint64
+	Guesttime   uint64
+	Cguesttime  uint64
 }
 
 type ProcStatsMap map[int]*ProcStats
@@ -125,10 +125,30 @@ func procPidStatSplit(line string) []string {
 }
 
 // ProcStatsReader reads and parses /proc/[pid]/stat for all of pids
-func ProcStatsReader(pids Pidlist, cmdNames CmdlineMap) ProcStatsMap {
-	cur := make(ProcStatsMap)
+func ProcStatsReader(pids Pidlist, filter Filters, cur *ProcSampleList, infoMap ProcInfoMap) {
+	sampleNum := 0
+	pidNum := 0
+	for pidNum < len(pids) {
+		pid := pids[pidNum]
+		pidNum++
 
-	for _, pid := range pids {
+		if filter.PidMatch(pid) == false {
+			continue
+		}
+		newPid := false
+
+		// we don't know the userid of this proc to filter until we read/stat /proc/pid/cmdline
+		// Do this only when we find a pid for the first time so we don't have to stat as much
+		var info *ProcInfo
+		var ok bool
+		if info, ok = infoMap[pid]; ok == true {
+			info.touch()
+		} else {
+			newPid = true
+			info = &ProcInfo{}
+			info.init()
+		}
+
 		lines, err := ReadFileLines(fmt.Sprintf("/proc/%d/stat", pid))
 		// pid could have exited between when we scanned the dir and now
 		if err != nil {
@@ -138,82 +158,70 @@ func ProcStatsReader(pids Pidlist, cmdNames CmdlineMap) ProcStatsMap {
 		// this format of this file is insane because comm can have split chars in it
 		parts := procPidStatSplit(lines[0])
 
-		stat := ProcStats{
-			time.Now(),
-			ReadUInt(parts[0]),                  // pid
-			strings.Map(StripSpecial, parts[1]), // comm
-			parts[2],            // state
-			ReadUInt(parts[3]),  // ppid
-			ReadInt(parts[4]),   // pgrp
-			ReadInt(parts[5]),   // session
-			ReadInt(parts[6]),   // tty_nr
-			ReadInt(parts[7]),   // tpgid
-			ReadUInt(parts[8]),  // flags
-			ReadUInt(parts[9]),  // minflt
-			ReadUInt(parts[10]), // cminflt
-			ReadUInt(parts[11]), // majflt
-			ReadUInt(parts[12]), // cmajflt
-			ReadUInt(parts[13]), // utime
-			ReadUInt(parts[14]), // stime
-			ReadUInt(parts[15]), // cutime
-			ReadUInt(parts[16]), // cstime
-			ReadInt(parts[17]),  // priority
-			ReadInt(parts[18]),  // nice
-			ReadUInt(parts[19]), // num_threads
-			// itrealvalue - not maintained
-			ReadUInt(parts[21]), // starttime
-			ReadUInt(parts[22]), // vsize
-			ReadUInt(parts[23]), // rss
-			ReadUInt(parts[24]), // rsslim
-			// bunch of stuff about memory addresses
-			ReadUInt(parts[38]), // processor
-			ReadUInt(parts[39]), // rt_priority
-			ReadUInt(parts[40]), // policy
-			ReadUInt(parts[41]), // delayacct_blkio_ticks
-			ReadUInt(parts[42]), // guest_time
-			ReadUInt(parts[43]), // cguest_time
+		if newPid {
+			info.Comm = strings.Map(StripSpecial, parts[1])
+			info.Pid = uint64(pid)
+			info.Ppid = ReadUInt(parts[3])
+			info.Pgrp = ReadInt(parts[4])
+			info.Session = ReadInt(parts[5])
+			info.Ttynr = ReadInt(parts[6])
+			info.Tpgid = ReadInt(parts[7])
+			info.Flags = ReadUInt(parts[8])
+			info.Starttime = ReadUInt(parts[21])
+			info.Nice = ReadInt(parts[18])
+			info.Rtpriority = ReadUInt(parts[39])
+			info.Policy = ReadUInt(parts[40])
+			info.updateCmdline() // note that this may leave UID at 0 if there's an error
+			infoMap[pid] = info
 		}
-		cur[pid] = &stat
-		updateCmdline(cmdNames, pid, stat.Comm)
+
+		if filter.UserMatch(int(info.UID)) == false {
+			continue
+		}
+
+		sample := &cur.Samples[sampleNum]
+		sample.Pid = pid
+		sample.Proc.CaptureTime = time.Now()
+		sample.Proc.Utime = ReadUInt(parts[13])
+		sample.Proc.Stime = ReadUInt(parts[14])
+		sample.Proc.Cutime = ReadUInt(parts[15])
+		sample.Proc.Cstime = ReadUInt(parts[16])
+		sample.Proc.Numthreads = ReadUInt(parts[19])
+		sample.Proc.Rss = ReadUInt(parts[23])
+		sample.Proc.Guesttime = ReadUInt(parts[42])
+		sample.Proc.Cguesttime = ReadUInt(parts[43])
+		sampleNum++
 	}
-	return cur
+	cur.Len = uint32(sampleNum)
 }
 
-// compute the delta between this sample and the previous one.
-func ProcStatsRecord(interval int, curMap, prevMap, sumMap ProcStatsMap) ProcStatsMap {
-	deltaMap := make(ProcStatsMap)
+// ProcStatsRecord computes the delta between the Proc elements of two ProcSampleLists
+// These lists do not need to have exactly the same processes in it, but they must both be sorted by Pid.
+// This generally works out because reading the pids from /proc puts them in a consistent order.
+// If we ever get a new source of the pidlist, perf_events or whatever, make sure it sorts.
+func ProcStatsRecord(interval uint32, curList, prevList ProcSampleList, sumMap, deltaMap ProcSampleMap) {
 
-	for pid, cur := range curMap {
-		if prev, ok := prevMap[pid]; ok == true {
+	curPos := uint32(0)
+	prevPos := uint32(0)
+
+	for curPos < curList.Len && prevPos < prevList.Len {
+		if curList.Samples[curPos].Pid == prevList.Samples[prevPos].Pid {
+			cur := &(curList.Samples[curPos].Proc)
+			prev := &(prevList.Samples[prevPos].Proc)
+			pid := curList.Samples[curPos].Pid
+
 			if _, ok := sumMap[pid]; ok == false {
-				sumMap[pid] = &ProcStats{}
+				sumMap[pid] = &ProcSample{}
 			}
-			deltaMap[pid] = &ProcStats{}
-			delta := deltaMap[pid]
+			deltaMap[pid] = &ProcSample{}
+			delta := &(deltaMap[pid].Proc)
 
 			delta.CaptureTime = cur.CaptureTime
-			duration := float64(delta.CaptureTime.Sub(prev.CaptureTime) / time.Millisecond)
+			duration := float64(cur.CaptureTime.Sub(prev.CaptureTime) / time.Millisecond)
 			scale := float64(interval) / duration
 
-			sum := sumMap[pid]
+			sum := &(sumMap[pid].Proc)
 			sum.CaptureTime = cur.CaptureTime
-			sum.Pid = cur.Pid
-			sum.Comm = cur.Comm
-			sum.State = cur.State
-			sum.Ppid = cur.Ppid
-			sum.Pgrp = cur.Pgrp
-			sum.Session = cur.Session
-			sum.Ttynr = cur.Ttynr
-			sum.Tpgid = cur.Tpgid
-			sum.Flags = cur.Flags
-			delta.Minflt = ScaledSub(cur.Minflt, prev.Minflt, scale)
-			sum.Minflt += SafeSub(cur.Minflt, prev.Minflt)
-			delta.Cminflt = ScaledSub(cur.Cminflt, prev.Cminflt, scale)
-			sum.Cminflt += SafeSub(cur.Cminflt, prev.Cminflt)
-			delta.Majflt = ScaledSub(cur.Majflt, prev.Majflt, scale)
-			sum.Majflt += SafeSub(cur.Majflt, prev.Majflt)
-			delta.Cmajflt = ScaledSub(cur.Cmajflt, prev.Cmajflt, scale)
-			sum.Cmajflt += SafeSub(cur.Cmajflt, prev.Cmajflt)
 			delta.Utime = ScaledSub(cur.Utime, prev.Utime, scale)
 			sum.Utime += SafeSub(cur.Utime, prev.Utime)
 			delta.Stime = ScaledSub(cur.Stime, prev.Stime, scale)
@@ -222,22 +230,18 @@ func ProcStatsRecord(interval int, curMap, prevMap, sumMap ProcStatsMap) ProcSta
 			sum.Cutime += SafeSub(cur.Cutime, prev.Cutime)
 			delta.Cstime = ScaledSub(cur.Cstime, prev.Cstime, scale)
 			sum.Cstime += SafeSub(cur.Cstime, prev.Cstime)
-			sum.Priority = cur.Priority
-			sum.Nice = cur.Nice
 			sum.Numthreads = cur.Numthreads
-			sum.Starttime = cur.Starttime
-			sum.Vsize = cur.Vsize
 			sum.Rss = cur.Rss
-			sum.Rsslim = cur.Rsslim
-			sum.Processor = cur.Processor
-			sum.Rtpriority = cur.Rtpriority
-			sum.Policy = cur.Policy
-			delta.Delayacctblkioticks = ScaledSub(cur.Delayacctblkioticks, prev.Delayacctblkioticks, scale)
-			sum.Delayacctblkioticks += SafeSub(cur.Delayacctblkioticks, prev.Delayacctblkioticks)
 			delta.Guesttime = ScaledSub(cur.Guesttime, prev.Guesttime, scale)
 			sum.Guesttime += SafeSub(cur.Guesttime, prev.Guesttime)
+			curPos++
+			prevPos++
+		} else {
+			if curList.Samples[curPos].Pid < prevList.Samples[prevPos].Pid {
+				curPos++
+			} else {
+				prevPos++
+			}
 		}
 	}
-
-	return deltaMap
 }

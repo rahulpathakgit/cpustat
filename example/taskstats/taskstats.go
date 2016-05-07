@@ -18,46 +18,27 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-package cpustat
+// Sinmple example of how to use the taskstats interface in cpustat
+
+package main
 
 import (
 	"fmt"
-	"log"
 	"os"
-	"strconv"
+
+	lib "github.com/uber-common/cpustat/lib"
 )
 
-var procPath = "/proc"
+func main() {
+	conn := lib.NLInit()
+	fmt.Println(conn)
 
-type Pidlist []int
+	sample := lib.ProcSample{}
+	sample.Pid = os.Getpid()
 
-// We churn the pidlist constantly, so this is an optimization to reuse the underlying list every time.
-// Replace the new values in the old list, shrinking or growing as necessary. This saves a bit of GC.
-// Note that reading /proc to get the pidlist returns the elements in a consistent order. If we ever
-// get a new source of a pidlist like perf_events or something, make sure it sorts.
-func GetPidList(list *Pidlist, maxProcsToScan int) {
-	var procDir *os.File
-	var procNames []string
-	var err error
+	err := lib.TaskStatsLookupPid(conn, &sample)
 
-	if procDir, err = os.Open(procPath); err != nil {
-		log.Fatalf("Open dir %s:%s", procPath, err)
-	}
-	if procNames, err = procDir.Readdirnames(maxProcsToScan); err != nil {
-		log.Fatal("pidlist Readdirnames: ", err)
-	}
-	if len(procNames) > maxProcsToScan-1 {
-		fmt.Println("proc table truncated because more than", maxProcsToScan, "procs found")
-	}
-	procDir.Close()
-
-	*list = (*list)[:0]
-	var pid int
-
-	for _, fileName := range procNames {
-		if pid, err = strconv.Atoi(fileName); err != nil {
-			continue
-		}
-		*list = append(*list, pid)
-	}
+	fmt.Printf("proc: %+v\n", sample.Proc)
+	fmt.Printf("task: %+v\n", sample.Task)
+	fmt.Println("err: ", err)
 }

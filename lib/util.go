@@ -71,6 +71,30 @@ func ReadSmallFile(filename string) ([]byte, error) {
 	return buf.Bytes(), err
 }
 
+// ReadSmallFileStat is like ReadSmallFile except it also returns a FileInfo from os.Stat
+func ReadSmallFileStat(filename string) ([]byte, os.FileInfo, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+
+	if buf == nil {
+		buf = bytes.NewBuffer(make([]byte, 0, 8192))
+	} else {
+		buf.Reset()
+	}
+	_, err = buf.ReadFrom(f)
+	f.Close()
+	return buf.Bytes(), info, err
+}
+
 // Read a small file and split on newline
 func ReadFileLines(filename string) ([]string, error) {
 	file, err := ReadSmallFile(filename)
@@ -102,7 +126,7 @@ func ReadUInt(str string) uint64 {
 	return val
 }
 
-// pull a int64 out of a string
+// pull an int64 out of a string
 func ReadInt(str string) int64 {
 	val, err := strconv.ParseInt(str, 10, 64)
 	if err != nil {

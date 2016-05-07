@@ -22,6 +22,8 @@ package cpustat
 
 import "time"
 
+// TaskStats is the set of data from linux/taskstats.h that seemed relevant and accurate.
+// There are other things in the kernel struct that are not tracked here, but perhaps should be.
 type TaskStats struct {
 	Capturetime         time.Time
 	Cpudelaycount       uint64 // delay count waiting for CPU, while runnable
@@ -30,58 +32,53 @@ type TaskStats struct {
 	Blkiodelaytotal     uint64 // delay time waiting for disk
 	Swapindelaycount    uint64 // delay count waiting for swap
 	Swapindelaytotal    uint64 // delay time waiting for swap
-	Minflt              uint64 // major page fault count
-	Majflt              uint64 // minor page fault count
-	Readchar            uint64 // total bytes read
-	Writechar           uint64 // total bytes written
-	Readsyscalls        uint64 // read system calls
-	Writesyscalls       uint64 // write system calls
-	Readbytes           uint64 // bytes read total
-	Writebytes          uint64 // bytes written total
-	Cancelledwritebytes uint64 // bytes of cancelled write IO, whatever that is
 	Nvcsw               uint64 // voluntary context switches
 	Nivcsw              uint64 // involuntary context switches
 	Freepagesdelaycount uint64 // delay count waiting for memory reclaim
 	Freepagesdelaytotal uint64 // delay time waiting for memory reclaim in unknown units
 }
 
+// TaskStatsMap maps pid to TaskStats, suually representing a sample of all pids
 type TaskStatsMap map[int]*TaskStats
 
-func TaskStatsReader(conn *NLConn, pids Pidlist, cmdNames CmdlineMap) TaskStatsMap {
-	cur := make(TaskStatsMap)
-
-	for _, pid := range pids {
-		stat, comm, err := TaskStatsLookupPid(conn, pid)
+// TaskStatsReader uses conn to build a TaskStatsMap for all pids.
+func TaskStatsReader(conn *NLConn, pids Pidlist, cur *ProcSampleList) {
+	for i := uint32(0); i < cur.Len; i++ {
+		err := TaskStatsLookupPid(conn, &cur.Samples[i])
 		// it would be better to check for other errors here
 		if err != nil {
 			continue
 		}
-		cur[pid] = stat
-		updateCmdline(cmdNames, pid, comm)
 	}
-	return cur
 }
 
-func TaskStatsRecord(interval int, curMap, prevMap, sumMap TaskStatsMap) TaskStatsMap {
-	deltaMap := make(TaskStatsMap)
+// TaskStatsRecord computes the delta between Task elements of two ProcSampleLists
+// These lists do not need to have exactly the same processes in it, but they must both be sorted by Pid.
+// This generally works out because reading the pids from /proc puts them in a consistent order.
+// If we ever get a new source of the pidlist, perf_events or whatever, make sure it sorts.
+func TaskStatsRecord(interval uint32, curList, prevList ProcSampleList, sumMap, deltaMap ProcSampleMap) {
+	curPos := uint32(0)
+	prevPos := uint32(0)
 
-	for pid, cur := range curMap {
-		if prev, ok := prevMap[pid]; ok == true {
-			if _, ok := sumMap[pid]; ok == false {
-				sumMap[pid] = &TaskStats{}
-			}
-			deltaMap[pid] = &TaskStats{}
-			delta := deltaMap[pid]
+	for curPos < curList.Len && prevPos < prevList.Len {
+		if curList.Samples[curPos].Pid == prevList.Samples[prevPos].Pid {
+			cur := &(curList.Samples[curPos].Task)
+			prev := &(prevList.Samples[prevPos].Task)
+			pid := curList.Samples[curPos].Pid
+
+			delta := &(deltaMap[pid].Task)
 
 			delta.Capturetime = cur.Capturetime
 			duration := float64(cur.Capturetime.Sub(prev.Capturetime) / time.Millisecond)
 			scale := float64(interval) / duration
 
-			sum := sumMap[pid]
+			// sumMap[pid] needs to exist
+			sum := &(sumMap[pid].Task)
 			sum.Capturetime = cur.Capturetime
 
 			delta.Cpudelaycount = ScaledSub(cur.Cpudelaycount, prev.Cpudelaycount, scale)
 			sum.Cpudelaycount += SafeSub(cur.Cpudelaycount, prev.Cpudelaycount)
+
 			delta.Cpudelaytotal = ScaledSub(cur.Cpudelaytotal, prev.Cpudelaytotal, scale)
 			sum.Cpudelaytotal += SafeSub(cur.Cpudelaytotal, prev.Cpudelaytotal)
 			delta.Blkiodelaycount = ScaledSub(cur.Blkiodelaycount, prev.Blkiodelaycount, scale)
@@ -92,24 +89,6 @@ func TaskStatsRecord(interval int, curMap, prevMap, sumMap TaskStatsMap) TaskSta
 			sum.Swapindelaycount += SafeSub(cur.Swapindelaycount, prev.Swapindelaycount)
 			delta.Swapindelaytotal = ScaledSub(cur.Swapindelaytotal, prev.Swapindelaytotal, scale)
 			sum.Swapindelaytotal += SafeSub(cur.Swapindelaytotal, prev.Swapindelaytotal)
-			delta.Minflt = ScaledSub(cur.Minflt, prev.Minflt, scale)
-			sum.Minflt += SafeSub(cur.Minflt, prev.Minflt)
-			delta.Majflt = ScaledSub(cur.Majflt, prev.Majflt, scale)
-			sum.Majflt += SafeSub(cur.Majflt, prev.Majflt)
-			delta.Readchar = ScaledSub(cur.Readchar, prev.Readchar, scale)
-			sum.Readchar += SafeSub(cur.Readchar, prev.Readchar)
-			delta.Writechar = ScaledSub(cur.Writechar, prev.Writechar, scale)
-			sum.Writechar += SafeSub(cur.Writechar, prev.Writechar)
-			delta.Readsyscalls = ScaledSub(cur.Readsyscalls, prev.Readsyscalls, scale)
-			sum.Readsyscalls += SafeSub(cur.Readsyscalls, prev.Readsyscalls)
-			delta.Writesyscalls = ScaledSub(cur.Writesyscalls, prev.Writesyscalls, scale)
-			sum.Writesyscalls += SafeSub(cur.Writesyscalls, prev.Writesyscalls)
-			delta.Readbytes = ScaledSub(cur.Readbytes, prev.Readbytes, scale)
-			sum.Readbytes += SafeSub(cur.Readbytes, prev.Readbytes)
-			delta.Writebytes = ScaledSub(cur.Writebytes, prev.Writebytes, scale)
-			sum.Writebytes += SafeSub(cur.Writebytes, prev.Writebytes)
-			delta.Cancelledwritebytes = ScaledSub(cur.Cancelledwritebytes, prev.Cancelledwritebytes, scale)
-			sum.Cancelledwritebytes += SafeSub(cur.Cancelledwritebytes, prev.Cancelledwritebytes)
 			delta.Nvcsw = ScaledSub(cur.Nvcsw, prev.Nvcsw, scale)
 			sum.Nvcsw += SafeSub(cur.Nvcsw, prev.Nvcsw)
 			delta.Nivcsw = ScaledSub(cur.Nivcsw, prev.Nivcsw, scale)
@@ -118,8 +97,14 @@ func TaskStatsRecord(interval int, curMap, prevMap, sumMap TaskStatsMap) TaskSta
 			sum.Freepagesdelaycount += SafeSub(cur.Freepagesdelaycount, prev.Freepagesdelaycount)
 			delta.Freepagesdelaytotal = ScaledSub(cur.Freepagesdelaytotal, prev.Freepagesdelaytotal, scale)
 			sum.Freepagesdelaytotal += SafeSub(cur.Freepagesdelaytotal, prev.Freepagesdelaytotal)
+			curPos++
+			prevPos++
+		} else {
+			if curList.Samples[curPos].Pid < prevList.Samples[prevPos].Pid {
+				curPos++
+			} else {
+				prevPos++
+			}
 		}
 	}
-
-	return deltaMap
 }

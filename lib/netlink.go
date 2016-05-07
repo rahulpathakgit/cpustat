@@ -54,17 +54,17 @@ func stringFromBytes(c []byte) string {
 	return string(c[:nullPos])
 }
 
-func readGetTaskstatsMessage(conn *NLConn) (*TaskStats, string, error) {
+func readGetTaskstatsMessage(conn *NLConn, task *TaskStats) error {
 	inBytes, err := conn.Read()
 	if err != nil {
-		return nil, "", err
+		return err
 	}
 	if len(inBytes) <= 0 {
-		return nil, "", fmt.Errorf("short read requesting taskstats info: %d bytes", len(inBytes))
+		return fmt.Errorf("short read requesting taskstats info: %d bytes", len(inBytes))
 	}
 	nlmsgs, err := syscall.ParseNetlinkMessage(inBytes)
 	if err != nil {
-		return nil, "", err
+		return err
 	}
 
 	if len(nlmsgs) != 1 {
@@ -78,15 +78,13 @@ func readGetTaskstatsMessage(conn *NLConn) (*TaskStats, string, error) {
 		if errno == -1 {
 			panic("no permission")
 		}
-		return nil, "", fmt.Errorf("Netlink error code %d getting taskstats for %d", errno, nlmsgs[0].Header.Pid)
+		return fmt.Errorf("Netlink error code %d getting taskstats for %d", errno, nlmsgs[0].Header.Pid)
 	}
 
+	task.Capturetime = time.Now()
 	var offset int
 	payload := nlmsgs[0].Data
 	endian := binary.LittleEndian
-
-	var stats TaskStats
-	stats.Capturetime = time.Now()
 
 	// these offsets and padding will break if struct taskstats ever changes
 	// gen header 0-3
@@ -103,21 +101,20 @@ func readGetTaskstatsMessage(conn *NLConn) (*TaskStats, string, error) {
 	offset++    // flag
 	offset++    // nice
 	offset += 6 // 6 byte padding
-	stats.Cpudelaycount = endian.Uint64(payload[offset : offset+8])
+	task.Cpudelaycount = endian.Uint64(payload[offset : offset+8])
 	offset += 8
-	stats.Cpudelaytotal = endian.Uint64(payload[offset : offset+8])
+	task.Cpudelaytotal = endian.Uint64(payload[offset : offset+8])
 	offset += 8
-	stats.Blkiodelaycount = endian.Uint64(payload[offset : offset+8])
+	task.Blkiodelaycount = endian.Uint64(payload[offset : offset+8])
 	offset += 8
-	stats.Blkiodelaytotal = endian.Uint64(payload[offset : offset+8])
+	task.Blkiodelaytotal = endian.Uint64(payload[offset : offset+8])
 	offset += 8
-	stats.Swapindelaycount = endian.Uint64(payload[offset : offset+8])
+	task.Swapindelaycount = endian.Uint64(payload[offset : offset+8])
 	offset += 8
-	stats.Swapindelaytotal = endian.Uint64(payload[offset : offset+8])
+	task.Swapindelaytotal = endian.Uint64(payload[offset : offset+8])
 	offset += 8
-	offset += 8 // cpu run real total
-	offset += 8 // cpu run virtual total
-	comm := stringFromBytes(payload[offset : offset+32])
+	offset += 8  // cpu run real total
+	offset += 8  // cpu run virtual total
 	offset += 32 // comm
 	offset++     // sched
 	offset += 7  // 7 byte padding
@@ -126,7 +123,7 @@ func readGetTaskstatsMessage(conn *NLConn) (*TaskStats, string, error) {
 	pid := endian.Uint32(payload[offset : offset+4])
 	offset += 4
 	if pid != tgid {
-		fmt.Printf("read value for unexpected pid %d != %d %+v\n", pid, tgid, stats)
+		fmt.Printf("read value for unexpected pid %d != %d %+v\n", pid, tgid, task)
 	}
 	offset += 4 // etime
 	offset += 4 // btime
@@ -134,41 +131,32 @@ func readGetTaskstatsMessage(conn *NLConn) (*TaskStats, string, error) {
 	offset += 8 // etime
 	offset += 8 // utime
 	offset += 8 // stime
-	stats.Minflt = endian.Uint64(payload[offset : offset+8])
-	offset += 8
-	stats.Majflt = endian.Uint64(payload[offset : offset+8])
-	offset += 8
+	offset += 8 // minflt
+	offset += 8 // majflt
 	offset += 8 // coremem
 	offset += 8 // virtmem
 	offset += 8 // hiwater rss
 	offset += 8 // hiwater vsz
-	stats.Readchar = endian.Uint64(payload[offset : offset+8])
+	offset += 8 // readchar
+	offset += 8 // writechar
+	offset += 8 // readsys
+	offset += 8 // writesys
+	offset += 8 // readbytes
+	offset += 8 // writebytes
+	offset += 8 // cancelled write bytes
+	task.Nvcsw = endian.Uint64(payload[offset : offset+8])
 	offset += 8
-	stats.Writechar = endian.Uint64(payload[offset : offset+8])
-	offset += 8
-	stats.Readsyscalls = endian.Uint64(payload[offset : offset+8])
-	offset += 8
-	stats.Writesyscalls = endian.Uint64(payload[offset : offset+8])
-	offset += 8
-	stats.Readbytes = endian.Uint64(payload[offset : offset+8])
-	offset += 8
-	stats.Writebytes = endian.Uint64(payload[offset : offset+8])
-	offset += 8
-	stats.Cancelledwritebytes = endian.Uint64(payload[offset : offset+8])
-	offset += 8
-	stats.Nvcsw = endian.Uint64(payload[offset : offset+8])
-	offset += 8
-	stats.Nivcsw = endian.Uint64(payload[offset : offset+8])
+	task.Nivcsw = endian.Uint64(payload[offset : offset+8])
 	offset += 8
 	offset += 8 // utimescaled
 	offset += 8 // stimescaled
 	offset += 8 // cputimescaled
-	stats.Freepagesdelaycount = endian.Uint64(payload[offset : offset+8])
+	task.Freepagesdelaycount = endian.Uint64(payload[offset : offset+8])
 	offset += 8
-	stats.Freepagesdelaytotal = endian.Uint64(payload[offset : offset+8])
+	task.Freepagesdelaytotal = endian.Uint64(payload[offset : offset+8])
 	offset += 8
 
-	return &stats, comm, nil
+	return nil
 }
 
 var (
@@ -207,9 +195,9 @@ func sendGetTaskstatsMessage(conn *NLConn, pid int) error {
 	return err
 }
 
-func TaskStatsLookupPid(conn *NLConn, pid int) (*TaskStats, string, error) {
-	sendGetTaskstatsMessage(conn, pid)
-	return readGetTaskstatsMessage(conn)
+func TaskStatsLookupPid(conn *NLConn, sample *ProcSample) error {
+	sendGetTaskstatsMessage(conn, sample.Pid)
+	return readGetTaskstatsMessage(conn, &sample.Task)
 }
 
 func readGetFamilyMessage(conn *NLConn) (uint16, error) {

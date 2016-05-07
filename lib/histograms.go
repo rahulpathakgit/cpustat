@@ -44,13 +44,14 @@ type ProcStatsHist struct {
 
 type ProcStatsHistMap map[int]*ProcStatsHist
 
-func UpdateProcStatsHist(histMap ProcStatsHistMap, deltaMap ProcStatsMap) {
-	for pid, delta := range deltaMap {
+func UpdateProcStatsHist(histMap ProcStatsHistMap, deltaMap ProcSampleMap) {
+	for pid, deltaSample := range deltaMap {
 		if _, ok := histMap[pid]; ok != true {
 			histMap[pid] = NewProcStatsHist()
 		}
 		hist := histMap[pid]
 
+		delta := &(deltaSample.Proc)
 		hist.Utime.RecordValue(int64(delta.Utime))
 		hist.Stime.RecordValue(int64(delta.Stime))
 		hist.Ustime.RecordValue(int64(delta.Utime + delta.Stime))
@@ -79,12 +80,13 @@ type TaskStatsHist struct {
 
 type TaskStatsHistMap map[int]*TaskStatsHist
 
-func UpdateTaskStatsHist(histMap TaskStatsHistMap, deltaMap TaskStatsMap) {
-	for pid, delta := range deltaMap {
+func UpdateTaskStatsHist(histMap TaskStatsHistMap, deltaMap ProcSampleMap) {
+	for pid, deltaSample := range deltaMap {
 		if _, ok := histMap[pid]; ok != true {
 			histMap[pid] = NewTaskStatsHist()
 		}
 		hist := histMap[pid]
+		delta := &(deltaSample.Task)
 
 		hist.Cpudelay.RecordValue(int64(delta.Cpudelaytotal))
 		hist.Iowait.RecordValue(int64(delta.Blkiodelaytotal))
@@ -106,7 +108,6 @@ type SystemStatsHist struct {
 	Sys          *hdrhistogram.Histogram
 	Idle         *hdrhistogram.Histogram
 	Iowait       *hdrhistogram.Histogram
-	Ctxt         *hdrhistogram.Histogram
 	ProcsTotal   *hdrhistogram.Histogram
 	ProcsRunning *hdrhistogram.Histogram
 	ProcsBlocked *hdrhistogram.Histogram
@@ -118,6 +119,7 @@ func UpdateSysStatsHist(hist *SystemStatsHist, delta *SystemStats) {
 	hist.Sys.RecordValue(int64(delta.Sys))
 	hist.Idle.RecordValue(int64(delta.Idle))
 	hist.Iowait.RecordValue(int64(delta.Iowait))
+	hist.ProcsTotal.RecordValue(int64(delta.ProcsTotal))
 	hist.ProcsRunning.RecordValue(int64(delta.ProcsRunning))
 	hist.ProcsBlocked.RecordValue(int64(delta.ProcsBlocked))
 }
@@ -129,6 +131,7 @@ func NewSysStatsHist() *SystemStatsHist {
 	hist.Sys = hdrhistogram.New(histMin, histMax, histSigFigs)
 	hist.Idle = hdrhistogram.New(histMin, histMax, histSigFigs)
 	hist.Iowait = hdrhistogram.New(histMin, histMax, histSigFigs)
+	hist.ProcsTotal = hdrhistogram.New(histMin, histMax, histSigFigs)
 	hist.ProcsRunning = hdrhistogram.New(histMin, histMax, histSigFigs)
 	hist.ProcsBlocked = hdrhistogram.New(histMin, histMax, histSigFigs)
 
